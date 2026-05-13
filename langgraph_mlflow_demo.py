@@ -11,9 +11,16 @@
 # MAGIC 3. **Checkpointing** — persisting state across turns with `thread_id`
 # MAGIC 4. **Human-in-the-loop** — pause with `interrupt()`, resume with `Command`
 # MAGIC 5. **MLflow + UC + Serving** — log → register → deploy
+# MAGIC 6. **RAG in LangGraph** — retriever as a tool vs. function node
+# MAGIC
+# MAGIC **Prerequisites:**
+# MAGIC - A Databricks workspace with access to a Foundation Model endpoint (e.g., `databricks-meta-llama-3-3-70b-instruct`)
+# MAGIC - A Unity Catalog schema where you can register models (for Part 5)
+# MAGIC - (Optional) A Vector Search index for Part 6 — or swap in any LangChain-compatible retriever
 
 # COMMAND ----------
 
+# DBTITLE 1,Install dependencies
 # MAGIC %pip install -qqqq -U langgraph langchain-core "mlflow[databricks]>=2.20.0" databricks-langchain databricks-agents
 # MAGIC dbutils.library.restartPython()
 
@@ -42,6 +49,7 @@
 
 # COMMAND ----------
 
+# DBTITLE 1,Define the agent state
 from typing import TypedDict, Annotated
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
@@ -63,6 +71,7 @@ class AgentState(TypedDict):
 
 # COMMAND ----------
 
+# DBTITLE 1,Define nodes (increment + respond)
 from databricks_langchain import ChatDatabricks
 
 LLM_ENDPOINT = "databricks-meta-llama-3-3-70b-instruct"
@@ -86,6 +95,7 @@ def respond(state: AgentState) -> dict:
 
 # COMMAND ----------
 
+# DBTITLE 1,Build and compile the graph
 builder = StateGraph(AgentState)
 builder.add_node("increment", increment_turn)
 builder.add_node("respond", respond)
@@ -102,12 +112,14 @@ graph = builder.compile()
 
 # COMMAND ----------
 
+# DBTITLE 1,Visualize the graph
 from IPython.display import Image, display
 
 display(Image(graph.get_graph().draw_mermaid_png()))
 
 # COMMAND ----------
 
+# DBTITLE 1,Invoke the graph
 result = graph.invoke({
     "messages": [HumanMessage(content="In one sentence, what is photosynthesis?")],
     "turn_count": 0,
@@ -145,6 +157,7 @@ print(f"Response:   {result['messages'][-1].content}")
 
 # COMMAND ----------
 
+# DBTITLE 1,Define structured output models
 from pydantic import BaseModel, Field
 
 
@@ -168,6 +181,7 @@ class JokeRewrite(BaseModel):
 
 # COMMAND ----------
 
+# DBTITLE 1,Define state, judge, and rewriter nodes
 from langgraph.graph import MessagesState
 from langchain_core.messages import AIMessage, SystemMessage
 from typing import Any
@@ -216,6 +230,7 @@ def rewriter(state: JokeReviewState) -> dict[str, Any]:
 
 # COMMAND ----------
 
+# DBTITLE 1,Build JokeReview graph with conditional routing
 def route_after_judge(state: JokeReviewState) -> str:
     return END if state.get("is_funny") else "rewriter"
 
@@ -243,6 +258,7 @@ display(Image(joke_graph.get_graph().draw_mermaid_png()))
 
 # COMMAND ----------
 
+# DBTITLE 1,Test with a funny joke
 # A genuinely funny joke — should short-circuit at `judge`
 funny = joke_graph.invoke({
     "messages": [HumanMessage(content="I told my wife she was drawing her eyebrows too high. She looked surprised.")]
@@ -253,6 +269,7 @@ for m in funny["messages"]:
 
 # COMMAND ----------
 
+# DBTITLE 1,Test with a flat joke
 # A flat joke — should route through `rewriter`
 flat = joke_graph.invoke({
     "messages": [HumanMessage(content="Why did the chicken cross the road? Because it wanted to.")]
@@ -275,6 +292,7 @@ for m in flat["messages"]:
 
 # COMMAND ----------
 
+# DBTITLE 1,Add a checkpointer (MemorySaver)
 from langgraph.checkpoint.memory import MemorySaver
 
 checkpointer = MemorySaver()
@@ -290,6 +308,7 @@ graph_with_memory = builder.compile(checkpointer=checkpointer)
 
 # COMMAND ----------
 
+# DBTITLE 1,Two-turn conversation on the same thread
 config = {"configurable": {"thread_id": "user-123"}}
 
 # Turn 1
@@ -316,6 +335,7 @@ print(f"Turn count: {result['turn_count']}  # counter persisted across turns")
 
 # COMMAND ----------
 
+# DBTITLE 1,Inspect saved state
 snapshot = graph_with_memory.get_state(config)
 print(f"Messages stored:  {len(snapshot.values['messages'])}")
 print(f"Turn count:       {snapshot.values['turn_count']}")
@@ -347,6 +367,7 @@ print(f"Next node to run: {snapshot.next}")
 
 # COMMAND ----------
 
+# DBTITLE 1,Build HITL graph with interrupt()
 from langgraph.types import interrupt, Command
 
 
@@ -390,6 +411,7 @@ display(Image(hitl_graph.get_graph().draw_mermaid_png()))
 
 # COMMAND ----------
 
+# DBTITLE 1,Kick off run and hit interrupt
 hitl_config = {"configurable": {"thread_id": "hitl-demo-1"}}
 
 paused = hitl_graph.invoke({}, config=hitl_config)
@@ -405,6 +427,7 @@ print(paused)
 
 # COMMAND ----------
 
+# DBTITLE 1,Inspect the pause point
 snap = hitl_graph.get_state(hitl_config)
 print(f"Next node:        {snap.next}")
 print(f"Pending interrupts: {snap.tasks[0].interrupts}")
@@ -421,6 +444,7 @@ print(f"State so far:     {snap.values}  # 'joke' not set yet — write_joke has
 
 # COMMAND ----------
 
+# DBTITLE 1,Resume with human answer
 result = hitl_graph.invoke(Command(resume="distributed systems"), config=hitl_config)
 print(f"Topic chosen: {result['topic']}")
 print(f"Joke:\n{result['joke']}")
@@ -496,6 +520,7 @@ print(f"Joke:\n{result['joke']}")
 
 # COMMAND ----------
 
+# DBTITLE 1,Set up WORK_DIR for agent file
 # `%%writefile` drops the file in the kernel's
 # CWD, but on Databricks notebooks that directory **isn't automatically on
 # `sys.path`** — so `from agent import AGENT` would fail. We fix that by writing
@@ -511,6 +536,7 @@ if WORK_DIR not in sys.path:
 
 # COMMAND ----------
 
+# DBTITLE 1,Write agent.py (ResponsesAgent)
 # MAGIC %%writefile /tmp/langgraph_demo/agent.py
 # MAGIC from typing import Generator
 # MAGIC
@@ -588,6 +614,7 @@ if WORK_DIR not in sys.path:
 
 # COMMAND ----------
 
+# DBTITLE 1,Smoke-test the agent module
 import importlib
 import agent
 importlib.reload(agent)
@@ -636,9 +663,10 @@ print(response.output)
 
 # COMMAND ----------
 
+# DBTITLE 1,Log model to MLflow experiment
 import mlflow
+from importlib.metadata import version
 from mlflow.models.resources import DatabricksServingEndpoint
-from pkg_resources import get_distribution
 
 LLM_ENDPOINT = "databricks-meta-llama-3-3-70b-instruct"
 
@@ -661,9 +689,9 @@ with mlflow.start_run():
         name="agent",
         input_example=input_example,
         pip_requirements=[
-            f"langgraph=={get_distribution('langgraph').version}",
-            f"langchain-core=={get_distribution('langchain-core').version}",
-            f"mlflow=={get_distribution('mlflow').version}",
+            f"langgraph=={version('langgraph')}",
+            f"langchain-core=={version('langchain-core')}",
+            f"mlflow=={version('mlflow')}",
             "databricks-langchain",
         ],
         resources=[DatabricksServingEndpoint(endpoint_name=LLM_ENDPOINT)],
@@ -681,9 +709,13 @@ print(f"Logged model URI: {logged.model_uri}")
 
 # COMMAND ----------
 
+# DBTITLE 1,Register model to Unity Catalog
+# ─── UPDATE THESE to a catalog/schema you have write access to ─────────────────
 CATALOG = "agentbuilder_serverless_stable_catalog"
 SCHEMA = "agent_builder"
 MODEL_NAME = "langgraph_demo_agent"
+# ───────────────────────────────────────────────────────────────────────────────
+
 uc_model = f"{CATALOG}.{SCHEMA}.{MODEL_NAME}"
 
 registered = mlflow.register_model(model_uri=logged.model_uri, name=uc_model)
@@ -705,6 +737,7 @@ print(f"Registered as {uc_model} version {registered.version}")
 
 # COMMAND ----------
 
+# DBTITLE 1,Deploy with agents.deploy
 from databricks import agents
 
 deployment = agents.deploy(
@@ -726,6 +759,7 @@ print(f"Review app: {deployment.review_app_url}")
 
 # COMMAND ----------
 
+# DBTITLE 1,Call the deployed endpoint
 from mlflow.deployments import get_deploy_client
 
 client = get_deploy_client("databricks")
@@ -774,9 +808,10 @@ print(response)
 from databricks_langchain import DatabricksVectorSearch
 from langchain_core.tools import tool
 
-# ─── Configure your Vector Search index ───────────────────────────────────────
-VS_INDEX_NAME = "your_catalog.your_schema.your_index"  # TODO: replace with your index
-VS_COLUMNS = ["content", "url"]  # columns to return from the index
+# ─── REPLACE with your own Vector Search index ────────────────────────────────────
+VS_INDEX_NAME = f"{CATALOG}.{SCHEMA}.patient_notes_index"
+VS_COLUMNS = ["text", "note_id", "patient_id"]  # columns to return from the index
+# ───────────────────────────────────────────────────────────────────────────────
 
 # The retriever object — works like any LangChain retriever (.invoke(query) → list[Document])
 vs_retriever = DatabricksVectorSearch(
@@ -790,7 +825,7 @@ def retrieve_docs(query: str) -> str:
     """Search the knowledge base for information relevant to the user's question."""
     docs = vs_retriever.invoke(query)
     return "\n\n---\n\n".join(
-        f"[{doc.metadata.get('url', 'source')}]\n{doc.page_content}" for doc in docs
+        f"{doc.metadata}\n{doc.page_content}" for doc in docs
     )
 
 
@@ -872,7 +907,7 @@ display(Image(tool_rag_graph.get_graph().draw_mermaid_png()))
 # DBTITLE 1,Invoke tool-based RAG
 # The LLM decides to retrieve because this requires specific knowledge
 result = tool_rag_graph.invoke({
-    "messages": [HumanMessage(content="What is Unity Catalog and how does it handle data governance?")]
+    "messages": [HumanMessage(content="Which of my patients have a mention of diabetes in their notes?")]
 })
 print("=== TOOL-BASED RAG ===")
 print(f"Response: {result['messages'][-1].content}")
@@ -946,7 +981,7 @@ display(Image(node_rag_graph.get_graph().draw_mermaid_png()))
 # DBTITLE 1,Invoke function-node RAG
 # Retrieval always fires — no LLM deciding whether to retrieve
 result = node_rag_graph.invoke({
-    "messages": [HumanMessage(content="What is Unity Catalog and how does it handle data governance?")],
+    "messages": [HumanMessage(content="Which of my patients have a mention of diabetes in their notes?")],
     "context": "",
 })
 print("=== FUNCTION-NODE RAG ===")
