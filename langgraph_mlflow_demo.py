@@ -26,6 +26,23 @@
 
 # COMMAND ----------
 
+# DBTITLE 1,Disable auto-tracing for teaching cells
+import mlflow
+
+# ─── MLflow configuration (set ONCE, early, so all traces & runs land here) ───
+username = spark.sql("SELECT current_user()").first()[0]
+experiment_path = f"/Users/{username}/langgraph_demo_experiment"
+
+mlflow.set_experiment(experiment_path)
+mlflow.set_registry_uri("databricks-uc")
+
+# Databricks auto-traces all LLM calls by default. Disable globally so the
+# teaching cells (Parts 1-4, Part 6 RAG demos) don't flood our experiment.
+# We'll re-enable briefly for the smoke test in Part 5 to show traces in the UI.
+mlflow.tracing.disable()
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## Part 1 — LangGraph fundamentals
 # MAGIC
@@ -521,89 +538,24 @@ print(f"Joke:\n{result['joke']}")
 # COMMAND ----------
 
 # DBTITLE 1,Set up WORK_DIR for agent file
-# `%%writefile` drops the file in the kernel's
-# CWD, but on Databricks notebooks that directory **isn't automatically on
-# `sys.path`** — so `from agent import AGENT` would fail. We fix that by writing
-# to a known absolute path and putting that path on `sys.path` ourselves.
-
 import os
-import sys
 
-WORK_DIR = "/tmp/langgraph_demo"
-os.makedirs(WORK_DIR, exist_ok=True)
-if WORK_DIR not in sys.path:
-    sys.path.insert(0, WORK_DIR)
+# On Databricks, the notebook CWD is its parent directory.
+# Since agent.py lives alongside this notebook, we just reference it directly.
+AGENT_PATH = "agent.py"
+
+assert os.path.exists(AGENT_PATH), f"{AGENT_PATH} not found in {os.getcwd()}"
 
 # COMMAND ----------
 
 # DBTITLE 1,Write agent.py (ResponsesAgent)
-# MAGIC %%writefile /tmp/langgraph_demo/agent.py
-# MAGIC from typing import Generator
-# MAGIC
-# MAGIC import mlflow
-# MAGIC from databricks_langchain import ChatDatabricks
-# MAGIC from langchain_core.messages import AnyMessage
-# MAGIC from langgraph.graph import START, END, StateGraph
-# MAGIC from langgraph.graph.message import add_messages
-# MAGIC from mlflow.models import set_model
-# MAGIC from mlflow.pyfunc import ResponsesAgent
-# MAGIC from mlflow.types.responses import (
-# MAGIC     ResponsesAgentRequest,
-# MAGIC     ResponsesAgentResponse,
-# MAGIC     ResponsesAgentStreamEvent,
-# MAGIC     output_to_responses_items_stream,
-# MAGIC     to_chat_completions_input,
-# MAGIC )
-# MAGIC from typing import Annotated, TypedDict
-# MAGIC
-# MAGIC mlflow.langchain.autolog()
-# MAGIC
-# MAGIC LLM_ENDPOINT = "databricks-meta-llama-3-3-70b-instruct"
-# MAGIC
-# MAGIC
-# MAGIC class AgentState(TypedDict):
-# MAGIC     messages: Annotated[list[AnyMessage], add_messages]
-# MAGIC
-# MAGIC
-# MAGIC def _build_graph():
-# MAGIC     llm = ChatDatabricks(endpoint=LLM_ENDPOINT)
-# MAGIC
-# MAGIC     def respond(state: AgentState) -> dict:
-# MAGIC         return {"messages": [llm.invoke(state["messages"])]}
-# MAGIC
-# MAGIC     builder = StateGraph(AgentState)
-# MAGIC     builder.add_node("respond", respond)
-# MAGIC     builder.add_edge(START, "respond")
-# MAGIC     builder.add_edge("respond", END)
-# MAGIC     return builder.compile()
-# MAGIC
-# MAGIC
-# MAGIC class LangGraphResponsesAgent(ResponsesAgent):
-# MAGIC     """Wraps a compiled LangGraph as an MLflow ResponsesAgent for serving."""
-# MAGIC
-# MAGIC     def __init__(self, graph):
-# MAGIC         self.graph = graph
-# MAGIC
-# MAGIC     def predict(self, request: ResponsesAgentRequest) -> ResponsesAgentResponse:
-# MAGIC         outputs = [
-# MAGIC             event.item
-# MAGIC             for event in self.predict_stream(request)
-# MAGIC             if event.type == "response.output_item.done"
-# MAGIC         ]
-# MAGIC         return ResponsesAgentResponse(output=outputs, custom_outputs=request.custom_inputs)
-# MAGIC
-# MAGIC     def predict_stream(
-# MAGIC         self,
-# MAGIC         request: ResponsesAgentRequest,
-# MAGIC     ) -> Generator[ResponsesAgentStreamEvent, None, None]:
-# MAGIC         cc_msgs = to_chat_completions_input([i.model_dump() for i in request.input])
-# MAGIC         for _, events in self.graph.stream({"messages": cc_msgs}, stream_mode=["updates"]):
-# MAGIC             for node_data in events.values():
-# MAGIC                 yield from output_to_responses_items_stream(node_data["messages"])
-# MAGIC
-# MAGIC
-# MAGIC AGENT = LangGraphResponsesAgent(_build_graph())
-# MAGIC set_model(AGENT)
+# MAGIC %md
+# MAGIC    
+# MAGIC > **`agent.py`** lives in the same directory as this notebook.  
+# MAGIC > Open it directly: [`agent.py`](/editor/files/2805848171739957)  
+# MAGIC >
+# MAGIC > It contains the `LangGraphResponsesAgent` class, graph construction, `autolog()`,
+# MAGIC > and `set_model(AGENT)`. Edit it there — no need to re-run a `%%writefile` cell.
 
 # COMMAND ----------
 
@@ -615,18 +567,22 @@ if WORK_DIR not in sys.path:
 # COMMAND ----------
 
 # DBTITLE 1,Smoke-test the agent module
-import importlib
-import agent
-importlib.reload(agent)
-
-from mlflow.types.responses import ResponsesAgentRequest
 from agent import AGENT
+from mlflow.types.responses import ResponsesAgentRequest
+
+# Re-enable tracing just for the smoke test so we get one trace in the UI
+mlflow.tracing.enable()
 
 request = ResponsesAgentRequest(
-    input=[{"role": "user", "content": "hello"}]
+    input=[{"role": "user", "content": "Hey friend!"}]
 )
 response = AGENT.predict(request)
 print(response.output)
+
+# Disable again — the teaching cells below (RAG demos) don't need to trace.
+# At serving time, agent.py calls autolog() in a fresh process — endpoint traces are unaffected.
+mlflow.langchain.autolog(disable=True)
+mlflow.tracing.disable()
 
 # COMMAND ----------
 
@@ -642,8 +598,8 @@ print(response.output)
 # MAGIC |---|---|---|
 # MAGIC | `mlflow.langchain.autolog()` | **Agent file** (`agent.py`) | Instruments LangGraph nodes as spans in MLflow Traces. At serving time, every request auto-generates a trace — no extra code needed. |
 # MAGIC | `mlflow.models.set_model(agent)` | **Agent file** (`agent.py`) | Tells MLflow which object is the inference entry point. This is what `log_model` will serialize and what the serving endpoint will call. |
-# MAGIC | `mlflow.set_experiment(path)` | **Driver notebook** (this file) | Sets the experiment that subsequent `start_run()` calls write to. Without it, runs go to the implicit notebook experiment — fine for personal work, confusing in shared repos. |
-# MAGIC | `mlflow.set_registry_uri("databricks-uc")` | **Driver notebook** (this file) | Routes `register_model` to Unity Catalog (not the legacy workspace registry). Required for `agents.deploy`. |
+# MAGIC | `mlflow.set_experiment(path)` | **Driver notebook** (cell 3) | Sets the experiment that subsequent `start_run()` calls write to. Set once at the top so *all* traces and runs—including the smoke test—land in the same experiment. |
+# MAGIC | `mlflow.set_registry_uri("databricks-uc")` | **Driver notebook** (cell 3) | Routes `register_model` to Unity Catalog (not the legacy workspace registry). Required for `agents.deploy`. |
 # MAGIC | `mlflow.start_run()` | **Driver notebook** (this file) | Creates a tracked run. Each run captures the model artifact, code snapshot, dependencies, and any params/metrics you log. |
 # MAGIC
 # MAGIC **The mental model:** The *agent file* is what runs at serving time (so
@@ -653,7 +609,7 @@ print(response.output)
 # MAGIC
 # MAGIC **Tracing at serving time:** Because `autolog()` is in the agent file, every
 # MAGIC inference request to the deployed endpoint automatically produces an MLflow
-# MAGIC Trace — a hierarchical view of each node's inputs, outputs, and latency. These
+# MAGIC Trace — a hierarchical view of each node’s inputs, outputs, and latency. These
 # MAGIC traces are persisted to the inference table attached to your endpoint, queryable
 # MAGIC via SQL for monitoring and evaluation.
 # MAGIC
@@ -664,19 +620,10 @@ print(response.output)
 # COMMAND ----------
 
 # DBTITLE 1,Log model to MLflow experiment
-import mlflow
 from importlib.metadata import version
 from mlflow.models.resources import DatabricksServingEndpoint
 
 LLM_ENDPOINT = "databricks-meta-llama-3-3-70b-instruct"
-
-# Derive the current user so each person gets their own experiment
-username = spark.sql("SELECT current_user()").first()[0]
-experiment_path = f"/Users/{username}/langgraph_demo_experiment"
-
-# Be explicit about where runs are tracked and where models are registered
-mlflow.set_experiment(experiment_path)
-mlflow.set_registry_uri("databricks-uc")
 
 # ResponsesAgent expects "input" (Responses API schema), not "messages" (legacy ChatAgent schema)
 input_example = {
@@ -685,7 +632,7 @@ input_example = {
 
 with mlflow.start_run():
     logged = mlflow.pyfunc.log_model(
-        python_model=os.path.join(WORK_DIR, "agent.py"),
+        python_model=AGENT_PATH,
         name="agent",
         input_example=input_example,
         pip_requirements=[
@@ -808,10 +755,12 @@ print(response)
 from databricks_langchain import DatabricksVectorSearch
 from langchain_core.tools import tool
 
-# ─── REPLACE with your own Vector Search index ────────────────────────────────────
+# Ensure tracing stays off for the RAG demo cells (log_model validation can re-enable it)
+mlflow.tracing.disable()
+
+# ─── Configure your Vector Search index ───────────────────────────────────────
 VS_INDEX_NAME = f"{CATALOG}.{SCHEMA}.patient_notes_index"
 VS_COLUMNS = ["text", "note_id", "patient_id"]  # columns to return from the index
-# ───────────────────────────────────────────────────────────────────────────────
 
 # The retriever object — works like any LangChain retriever (.invoke(query) → list[Document])
 vs_retriever = DatabricksVectorSearch(
